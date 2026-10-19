@@ -7,6 +7,198 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [9.2.0] - 2026-10-12
+
+### Added
+
+- Add an opt-in `enable_torch_compile` setting to classifiers and regressors, with selective compilation of v3.5 aggregation regions on PyTorch 2.6 or newer. ([#1331](https://github.com/PriorLabs/TabPFN/pull/1331))
+
+### Fixed
+
+- Fix incorrect predictions and repeated cache dequantization for batched TabPFN-3 and TabPFN-3.5 cached inference with memory saving enabled. ([#1365](https://github.com/PriorLabs/TabPFN/pull/1365))
+
+
+## [9.1.0] - 2026-10-02
+
+### Breaking Changes
+
+- Remove the unused `cache_trainset_representation` argument from `ArchitectureModule.get_architecture`, `load_model` and `load_model_criterion_config`, and the `fit_mode` argument from `initialize_tabpfn_model`. ([#1250](https://github.com/PriorLabs/TabPFN/pull/1250))
+- Replace `ClassifierModelSpecs`, `RegressorModelSpecs`, and `BaseModelSpecs` with the unified `ModelSpecs` dataclass. Update imports, constructors, and task-specific type checks; retain `norm_criterion` for legacy regression models without embedded borders. ([#1315](https://github.com/PriorLabs/TabPFN/pull/1315))
+
+### Added
+
+- Add `kv_cache_precision="adaptive"`. ([#1299](https://github.com/PriorLabs/TabPFN/pull/1299))
+- Add a shared `ModelSpecs` dataclass for in-memory classification and regression. Regression automatically derives its distribution from `model.regression_borders`; legacy models without embedded borders still require `norm_criterion`. ([#1315](https://github.com/PriorLabs/TabPFN/pull/1315))
+
+### Changed
+
+- Faster modality detection on wide inputs: a numeric array's distinct values are counted for all columns at once instead of per column, a numeric column stored as `object` is recognized with `pd.api.types.infer_dtype` instead of a value-by-value walk, and the nullable-dtype coercion is decided once per dtype. The inferred modalities are unchanged. ([#1255](https://github.com/PriorLabs/TabPFN/pull/1255))
+- Building a model from a checkpoint no longer runs torch's random parameter initialisation, which made up most of the per-fit model construction time. ([#1257](https://github.com/PriorLabs/TabPFN/pull/1257))
+- `SAMPLE_SUBSAMPLING_METHOD="majority_downsample"` now corrects the target prior shift it introduces, so predicted probabilities and regression distributions are calibrated to the training data rather than to the downsampled context. `predict_proba_batched` and `predict_batched` raise with this sampler; score datasets individually instead. ([#1270](https://github.com/PriorLabs/TabPFN/pull/1270))
+- Relabel the README architecture and attention diagrams as TabPFN-3.5. ([#1282](https://github.com/PriorLabs/TabPFN/pull/1282))
+- - `examples/finetune_regressor.py` now fine-tunes on the bigger OpenML diamonds dataset. ([#1290](https://github.com/PriorLabs/TabPFN/pull/1290))
+- `n_preprocessing_jobs > 1` now parallelises the per-estimator preprocessing over threads instead of processes, which we have found to be faster. Parallelisation is turned off by default, as previously. ([#1295](https://github.com/PriorLabs/TabPFN/pull/1295))
+- Link the TabPFN-3.5 technical report and add its BibTeX entry to the README citation section. ([#1296](https://github.com/PriorLabs/TabPFN/pull/1296))
+- - Batch estimators. ([#1312](https://github.com/PriorLabs/TabPFN/pull/1312))
+- Estimators fitted with `fit_mode="fit_with_cache"` use less host memory and save to smaller files. Predictions are unchanged. ([#1323](https://github.com/PriorLabs/TabPFN/pull/1323))
+- Note TabPFN-3.5-Fast alongside TabPFN-3 and TabPFN-3.5 in the README CPU sample-limit description. ([#1328](https://github.com/PriorLabs/TabPFN/pull/1328))
+
+### Fixed
+
+- Fix `FullSupportBarDistribution` CDF, quantiles, and sampling to match its half-normal tails while preserving batch shape, device, and dtype. ([#1215](https://github.com/PriorLabs/TabPFN/pull/1215))
+- The opt-in built-model cache (`TABPFN_MODEL_CACHE_SIZE`) now keys on device and inference precision, so estimators with different settings no longer share one model. ([#1219](https://github.com/PriorLabs/TabPFN/pull/1219))
+- numpy `StringDType` arrays are accepted as input at fit and predict, like unicode and `object` arrays (numpy 2.5 or newer). ([#1269](https://github.com/PriorLabs/TabPFN/pull/1269))
+- Regression density and likelihood evaluation reports far fewer infinite NLLs for targets in a narrow bucket or in a distribution's tail. ([#1288](https://github.com/PriorLabs/TabPFN/pull/1288))
+- Fixed `FinetunedTabPFNRegressor` computing the loss against z-scored targets for ensemble members that use a target transform (such as the default `safepower`); their loss now uses the transformed targets they predict in. ([#1290](https://github.com/PriorLabs/TabPFN/pull/1290))
+- MPS support and GQA attention now detect the installed torch version correctly when `torch.__version__` is a plain string. ([#1301](https://github.com/PriorLabs/TabPFN/pull/1301))
+- Raise a proper validation error when the training inputs have mismatched lengths or are not two-dimensional, so these mistakes are reported as user errors like all other input problems ([#1307](https://github.com/PriorLabs/TabPFN/pull/1307))
+- Fixed TabPFN-3.5 jumping too far when it predicts past the range of a feature, most visibly on a time feature whose values repeat, such as a year column with one row per month. Predictions change for any table with values outside the range seen at fit. ([#1310](https://github.com/PriorLabs/TabPFN/pull/1310))
+- `TabPFNRegressor` no longer fails or returns meaningless predictions when the target's mean is large relative to its spread (e.g. ID-like values around `1e10`). ([#1311](https://github.com/PriorLabs/TabPFN/pull/1311))
+- Allow fitted estimator archives to save supported dataclass-valued initialization parameters such as InferenceConfig. ([#1321](https://github.com/PriorLabs/TabPFN/pull/1321))
+- Forced float16 squashing preprocessing no longer squashes a finite extreme value to zero. ([#1322](https://github.com/PriorLabs/TabPFN/pull/1322))
+- Saving a fitted estimator no longer copies the model weights, so it uses less memory, and saving a `fit_mode="fit_with_cache"` estimator no longer briefly removes its caches while another thread may be predicting. ([#1325](https://github.com/PriorLabs/TabPFN/pull/1325))
+- Fixed `predict` raising `could not convert string to float` when a column was constant or all-missing at fit and held a string at predict. Such a column now gets its fit-time value back at predict, so it carries no information there. ([#1329](https://github.com/PriorLabs/TabPFN/pull/1329))
+- Avoid a runtime C compiler requirement in batched v3 and v3.5 regression target encoding on recent PyTorch versions. ([#1338](https://github.com/PriorLabs/TabPFN/pull/1338))
+
+
+## [9.0.0] - 2026-09-15
+
+### Breaking Changes
+
+- `eval_metric="roc_auc"` combined with `tune_decision_thresholds=True` now raises instead of silently optimizing balanced accuracy. The threshold search scores thresholded labels, and the ROC AUC of a single operating point equals `(TPR + TNR) / 2`, so the two metrics produced identical thresholds. Pass `eval_metric="balanced_accuracy"` to keep the previous behaviour. ([#1153](https://github.com/PriorLabs/TabPFN/pull/1153))
+- `eval_metric="log_loss"` combined with `tune_decision_thresholds=True` now raises instead of silently optimizing accuracy. The threshold search scores hard labels, and log loss over clipped hard labels is a constant multiple of the error rate. Use `calibrate_temperature=True`, which optimizes log loss directly. ([#1239](https://github.com/PriorLabs/TabPFN/pull/1239))
+- TabPFN-3.5 is the default model: `TabPFNClassifier()` and `TabPFNRegressor()` now load `ModelVersion.V3_5` unless a `model_path` or another version is given. The previous default, TabPFN-3, stays available through `create_default_for_version(ModelVersion.V3)`. ([#1273](https://github.com/PriorLabs/TabPFN/pull/1273))
+
+### Added
+
+- `InferenceConfig.SOFTMAX_TEMPERATURE` lets a checkpoint carry the softmax temperature it was trained for. `softmax_temperature` now defaults to `"auto"`, meaning "use the checkpoint's value"; passing a float still overrides it for every model, though naming a temperature through both `softmax_temperature` and `inference_config` now raises. Existing checkpoints lack the field and fall back to its default of `0.9`, the value the interface applied before, so nothing changes for them. Ensembling checkpoints that declare different temperatures now raises and asks for one to be passed explicitly. ([#1220](https://github.com/PriorLabs/TabPFN/pull/1220))
+- `InferenceConfig.N_ESTIMATORS` lets a checkpoint declare how many estimators to run, and means exactly what the `n_estimators` argument means: an int is used as given and never raised for feature coverage, `"auto"` (the default) means 8 and may be raised. `n_estimators="auto"` now takes the checkpoint's value, so checkpoints without the field behave as before. An explicit `n_estimators` still wins; naming a count both ways, or ensembling checkpoints that disagree on it, raises. ([#1230](https://github.com/PriorLabs/TabPFN/pull/1230))
+- `inference_config={"TRANSFORM_DATES": True}` expands a column holding a genuine datetime dtype (`datetime64`, tz-aware, or `period`) into calendar features: the year, the day of year, the seconds since the epoch, and the cyclical month, day and weekday pairs, plus the time of day when the column carries one. Off by default, in which case such a column is refused with a `TabPFNValidationError` naming it. Not run by the fine-tuning estimators. ([#1236](https://github.com/PriorLabs/TabPFN/pull/1236))
+- `inference_config={"TRANSFORM_TEXT": True}` expands a text column into numeric features via `skrub.StringEncoder`: tf-idf over its character n-grams, reduced by a truncated SVD to at most `TEXT_N_COMPONENTS` features (30 by default). A column is text when it has pandas' `string` dtype, in any storage, or a pyarrow string dtype, more than `MIN_CARDINALITY_FOR_TEXT` distinct values, and is not declared categorical; an `object` or `category` column is never expanded. An unseen string is encoded by the character n-grams it shares with the training column; a missing value, or a string sharing none, becomes an all-zero row. Off by default, in which case nothing changes: such a column is ordinal-encoded as a high-cardinality category and `fit()` warns about it by name, as before, the warning now pointing at `TRANSFORM_TEXT`. Fitted estimators expose `categorical_features_indices_`, the declared categorical positions in the validated input after any date or text expansion. Not run by the fine-tuning estimators. ([#1240](https://github.com/PriorLabs/TabPFN/pull/1240))
+- Add `InferenceConfig.SAMPLE_SUBSAMPLING_METHOD` to choose how rows are drawn per estimator when `SUBSAMPLE_SAMPLES` is set: `"balanced"`, `"stratified"`, or the new `"majority_downsample"`, which groups rows by exact target value, keeps every row outside the single most frequent group, and fills the remaining budget from that majority group. This keeps the whole minority class for imbalanced classification and downsamples the repeated value for zero-inflated regression targets. Targets without a unique majority warn and fall back to the task's default sampling method. The default `"auto"` keeps the previous behavior (stratified for classification, balanced for regression). `TabPFNClassifier.fit_with_differentiable_input` now also uses stratified row subsampling, matching `fit`. ([#1253](https://github.com/PriorLabs/TabPFN/pull/1253))
+
+### Changed
+
+- `clean_data` no longer casts a numeric input to float64; the preprocessing pipeline widens its own copy instead, cutting peak host RAM on a 1M x 2000 float32 fit + predict from 26.1 GB to 15.4 GB with identical outputs. ([#1218](https://github.com/PriorLabs/TabPFN/pull/1218))
+- `matplotlib` is now a direct dependency instead of behind the optional `viz` extra (which has been removed), since `skrub` (a new direct dependency, used by upcoming work) already requires it transitively. ([#1222](https://github.com/PriorLabs/TabPFN/pull/1222))
+- Widen the `skrub` dependency from the 0.10 series to 0.7 or newer. ([#1231](https://github.com/PriorLabs/TabPFN/pull/1231))
+- The out-of-memory error now reports the feature count TabPFN actually ran on rather than the width of the frame passed to `fit`, which can be narrower when date expansion is on. ([#1236](https://github.com/PriorLabs/TabPFN/pull/1236))
+- Dates are recognized only from a genuine datetime dtype, never by parsing string columns with `pd.to_datetime()`: a string column that merely looks like a date is read as a plain category or text. The never-consumed `FeatureModality.DATE` has been removed. ([#1236](https://github.com/PriorLabs/TabPFN/pull/1236))
+- `load_fitted_tabpfn_model` and the `load_from_fit_state` class methods now default to `device="auto"` instead of `device="cpu"`, so a GPU-fitted estimator no longer silently reloads onto CPU. Pass `device="cpu"` for the old behavior. ([#1243](https://github.com/PriorLabs/TabPFN/pull/1243))
+- Declared categoricals are taken at face value: a string column listed in `categorical_features_indices` is categorical at any cardinality, never text, and a pandas `category` column now counts as declared (its position is merged into `categorical_features_indices_`). `MIN_CARDINALITY_FOR_TEXT` only applies to undeclared string columns. ([#1245](https://github.com/PriorLabs/TabPFN/pull/1245))
+- Clarify estimator usage guidance for TabPFN-3 and later versions, covering dataset capacity, subsampling, and automatic handling of categorical and missing feature values without manual preprocessing. ([#1247](https://github.com/PriorLabs/TabPFN/pull/1247))
+- Relicense the TabPFN code under standard Apache 2.0, removing the additional attribution requirement from the code license. Model weight licenses are unchanged: TabPFN-2 retains its existing Prior Labs License, and TabPFN-2.5, TabPFN-2.6, and TabPFN-3 remain non-commercial. ([#1271](https://github.com/PriorLabs/TabPFN/pull/1271))
+
+### Fixed
+
+- - Fixed importance-based feature subsampling drawing every estimator's non-top
+    features independently instead of from a shared round-robin pool, which could
+    leave features unseen by any ensemble member even when the combined feature
+    budget covered them all. Results change for fits using
+    `gini_feature_importance` (directly or via `"auto"` on large, wide datasets). ([#1141](https://github.com/PriorLabs/TabPFN/pull/1141))
+- Fix decision-threshold tuning assigning an arbitrary threshold to classes with no rows in the tuning holdout, which heavily boosted the class for `eval_metric='roc_auc'` and suppressed it for the other metrics. Such classes now receive a neutral threshold. ([#1152](https://github.com/PriorLabs/TabPFN/pull/1152))
+- Cut `TorchSquashingScaler`'s peak device memory from 13.0x its input to 0.4x for `fit` and 5.8x to 1.0x for `transform`, with byte-identical outputs, so large fits no longer exhaust VRAM. ([#1223](https://github.com/PriorLabs/TabPFN/pull/1223))
+- Above 100k rows, importance-based feature subsampling gave every estimator its own feature ranking and its own sampling pool, so some features ended up in no ensemble member at all even when the combined feature budget covered them. A single shared ranking now restores full coverage, and replaces up to `n_estimators` LightGBM fits with one. Results change for `gini_feature_importance` fits (directly or via `"auto"`) above 100k rows. ([#1229](https://github.com/PriorLabs/TabPFN/pull/1229))
+- Prevent batched predictions from depending on other datasets' preprocessed feature widths. ([#1233](https://github.com/PriorLabs/TabPFN/pull/1233))
+- `get_embeddings` now cleans categorical columns the way `predict` does, from the fitted feature schema rather than from the indices declared in `categorical_features_indices`. ([#1236](https://github.com/PriorLabs/TabPFN/pull/1236))
+- `TabPFNRegressor` now reports the dataset sizes in its out-of-memory error. Only `TabPFNClassifier` passed them on, so the regressor's message omitted the "Your sizes" line entirely. ([#1236](https://github.com/PriorLabs/TabPFN/pull/1236))
+- Fitting or predicting on a DataFrame with a genuine datetime column beside any other dtype, or with a `timedelta64` or `period` column, no longer aborts with numpy's dtype-promotion error or `Unknown dtype: period[D]`. A datetime or period column is refused with a clear error, or expanded with `TRANSFORM_DATES`; a duration becomes its length in seconds. ([#1236](https://github.com/PriorLabs/TabPFN/pull/1236))
+- Fixed `TorchQuantileTransformer`'s sklearn-equivalence test failing on torch 2.14. torch 2.14 derives the sample index for a quantile in double precision, so the transformer's float32 quantile positions can land just short of an exact order statistic and get interpolated instead, shifting transformed values by up to 1.1e-4 where two neighbouring samples are close together. The test's tolerance now accommodates that; the transform still runs in float32, since computing the fit in float64 would cost performance in the pipeline for a difference this small. ([#1238](https://github.com/PriorLabs/TabPFN/pull/1238))
+- Fixed saving a fitted estimator whose `device` is a `torch.device` (or a sequence of them), which raised `TypeError: Object of type device is not JSON serializable`. ([#1243](https://github.com/PriorLabs/TabPFN/pull/1243))
+- numpy arrays of strings are accepted as input at fit and predict, like `object` arrays and DataFrames. ([#1246](https://github.com/PriorLabs/TabPFN/pull/1246))
+- TabPFN-3.5 models work with the decoder-head readout in `tabpfn-extensions`. ([#1274](https://github.com/PriorLabs/TabPFN/pull/1274))
+- TabPFN-3.5 gives correct predictions with `inference_precision=torch.float16` on torch 2.5 to 2.8, where it returned near-uniform probabilities, and computes in float64 throughout when `inference_precision=torch.float64` is set. ([#1275](https://github.com/PriorLabs/TabPFN/pull/1275))
+
+### Deprecated
+
+- Passing an `InferenceConfig` object as `inference_config` is deprecated and now emits a `FutureWarning`. Unlike a dict, which overrides only the keys it names, an object replaces the checkpoint's config as a whole, so every field it does not set takes a class default rather than the checkpoint-specific value — which can silently degrade predictions. Pass a dict of just the settings you want to change; `dataclasses.asdict(config)` reproduces the old behavior for callers that do want a full replacement. ([#1224](https://github.com/PriorLabs/TabPFN/pull/1224))
+
+
+## [8.5.0] - 2026-08-27
+
+### Breaking Changes
+
+- Cache the decoder keys instead of the train embeddings. ` get_embeddings(model, X_test, data_source="train")` is not supported with cached infernce anymore. ([#1189](https://github.com/PriorLabs/TabPFN/pull/1189))
+- `tabpfn.model_loading.download_all_models()` now raises an exception if one or more of the models fails to download. It will still download all possible models before raising the exception. ([#1195](https://github.com/PriorLabs/TabPFN/pull/1195))
+
+### Added
+
+- `fit()` now recognizes a date-like string column internally, though nothing yet expands it into calendar features: it is still read as a plain category or text. We also added `InferenceConfig.MIN_CARDINALITY_FOR_TEXT`, to differentiate between category-vs-text and category-vs-number decisions; they default to the same value, since we are still not handling text. ([#1205](https://github.com/PriorLabs/TabPFN/pull/1205))
+
+### Changed
+
+- Reduced peak host memory during preprocessing: the ensemble preprocessor no longer rebuilds the feature matrix in steps that cannot change it, taking transient RSS from 42.7 GB to 12.0 GB (-72%), and wall time with it, on a 666,667 x 2,000 float64 fit. Preprocessed outputs are unchanged. ([#1186](https://github.com/PriorLabs/TabPFN/pull/1186))
+- Reduced peak host memory during preprocessing for tables with categorical columns: the reshape and ordinal-encoding steps no longer rebuild the feature matrix to reorder it or to encode part of it, taking transient RSS from 3.33 GB to 2.80 GB (-16%) on a 333,333 x 400 half-categorical fit. Preprocessed outputs are unchanged. ([#1187](https://github.com/PriorLabs/TabPFN/pull/1187))
+- Speed up modality detection on large string columns. Deciding whether a column holds numbers or dates now stops at the first value that does not parse within a 1024-row prefix, instead of parsing every row first. Detection of a 1-million-row free-text column drops from roughly 14 seconds to under 20 milliseconds; the answers are unchanged. ([#1208](https://github.com/PriorLabs/TabPFN/pull/1208))
+
+### Fixed
+
+- Fix an "illegal memory access" crash in the backward pass when fine-tuning on large batches: FlashAttention's backward indexes its workspace with 32-bit integers, so the batch is now chunked to keep each call inside that range. ([#1184](https://github.com/PriorLabs/TabPFN/pull/1184))
+- Fix `fit_mode="fit_with_cache"` raising `TypeError: forward() missing 1 required positional argument: 'task_type'` for architectures whose forward pass takes a `task_type`: the KV cache build now forwards it, like the prediction paths already did. ([#1197](https://github.com/PriorLabs/TabPFN/pull/1197))
+- `fit()` no longer crashes the interpreter outright on a table whose text column holds a hash-like value such as `"8e2569614270f3d8b9e7038efac9f116"`. Modality detection asked `pandas.to_numeric` whether a column was numeric; below pandas 3.0 that function has a signed 32-bit integer overflow in its scientific-notation parser and segfaults on a string whose exponent lands in `[2**31, 2**32)` ([pandas#63650](https://github.com/pandas-dev/pandas/issues/63650), fixed upstream in pandas 3.0). A segfault cannot be caught with `try`/`except`, so below pandas 3.0 the check now reads one value at a time with Python's built-in `float`, which does not share the bug. On pandas 3.0 and later the check is unchanged. ([#1203](https://github.com/PriorLabs/TabPFN/pull/1203))
+- Fix `TabPFNRegressor` rejecting a checkpoint whose config also describes a classification head: the criterion now follows the task the estimator is built for rather than being inferred from `max_num_classes`. Loading a regression checkpoint into `TabPFNClassifier` now raises instead of silently building an unused bar distribution. ([#1204](https://github.com/PriorLabs/TabPFN/pull/1204))
+
+
+## [8.4.0] - 2026-08-19
+
+### Added
+
+- `TabPFNRegressor` now accepts `eval_metric` and `tuning_config` arguments: passing `tuning_config={"calibrate_temperature": True}` makes `fit()` calibrate the temperature of the aggregated ensemble distribution on a holdout, sharpening or widening the predicted distribution as the data demands and improving every `predict()` output type, including the predicted quantiles. Set `eval_metric` to `"nll"` (the default, negative log-likelihood), `"crps"` (continuous ranked probability score, the same implementation used by the finetuning loss) to choose which quantity the calibration optimises; they weight the predicted distribution differently and pick noticeably different temperatures, so pick the metric you will be judged by. ([#1172](https://github.com/PriorLabs/TabPFN/pull/1172))
+- In the previous setup, all GPUs in finetuning with DDP held all activations of all estimators in memory. This PR divides estimator activations across the available GPUs. ([#1182](https://github.com/PriorLabs/TabPFN/pull/1182))
+
+### Changed
+
+- The temperature grid searched when calibrating `TabPFNClassifier`'s softmax temperature now contains 1.0 exactly, so calibration can leave a distribution untouched. Previously the grid straddled 1.0 without including it, meaning a calibrated model always applied some correction even when none was warranted. Calibrated temperatures may therefore differ slightly from previous releases. ([#1172](https://github.com/PriorLabs/TabPFN/pull/1172))
+- `fit()` cleans large tables with far less memory and time: the redundant float64 copies are gone, cutting both transient memory and wall time by about two thirds on a 5.3 GB all-numeric table. ([#1173](https://github.com/PriorLabs/TabPFN/pull/1173))
+- `fit()` uses less memory on tables with categorical columns: the encoded array is now assembled in place instead of being stacked and then reordered, cutting transient memory by about a quarter on a half-string table. ([#1174](https://github.com/PriorLabs/TabPFN/pull/1174))
+- `fit()` no longer slows to a crawl on wide tables with categorical columns under pandas < 3: the dtype casts no longer rebuild the frame one column at a time, which took minutes on a 333,333 x 400 table and now takes seconds. ([#1180](https://github.com/PriorLabs/TabPFN/pull/1180))
+- Reduce peak GPU memory during KV-cache construction by quantizing layers as they are built and temporarily staging completed estimator caches on CPU in memory-saving mode. ([#1183](https://github.com/PriorLabs/TabPFN/pull/1183))
+
+### Fixed
+
+- `TabPFNRegressor.predict_batched` now raises `NotImplementedError` when the estimator was constructed with a `tuning_config`, instead of silently returning uncalibrated predictions. The ensemble temperature is calibrated on each dataset's own holdout, so a fused batch has no single temperature to apply; score such datasets individually with `predict`. This matches the existing guard in `TabPFNClassifier.predict_proba_batched`. ([#1172](https://github.com/PriorLabs/TabPFN/pull/1172))
+
+
+## [8.3.0] - 2026-08-12
+
+### Added
+
+- Fine-tuning now supports `validation_frequency` to run validation and early-stopping checks every N epochs. ([#811](https://github.com/PriorLabs/TabPFN/pull/811))
+- Add `ManyClassDecoder.attention_weights`, the canonical per-training-row attention distribution of the multiclass decoder head, so interpretability tooling can read out which training rows drive a prediction without reimplementing the head's internal forward pass. The method exists only on multiclass models that use this decoder. ([#1142](https://github.com/PriorLabs/TabPFN/pull/1142))
+- Add fp8 kv cache dtype. ([#1157](https://github.com/PriorLabs/TabPFN/pull/1157))
+- `fit()` now warns when a column of `X` looks like free text. ([#1159](https://github.com/PriorLabs/TabPFN/pull/1159))
+- Add an opt-in built-model cache to `load_model`, enabled via the `TABPFN_MODEL_CACHE_SIZE` environment variable (default off). When set, repeated loads of the same checkpoint reuse the constructed model instead of rebuilding the architecture and re-running `load_state_dict`. Only the non-mutating (`cache_trainset_representation=False`) build is cached. ([#1162](https://github.com/PriorLabs/TabPFN/pull/1162))
+- Add `TabPFNRegressor.predict_batched`, the regression counterpart to `TabPFNClassifier.predict_proba_batched`. It preprocesses each `(X_train, y_train, X_test)` triple exactly as `fit` + `predict` does, stacks the datasets on the model's batch dimension and scores them with a single fused forward per estimator, then decodes each dataset with its own target standardisation and per-estimator border transforms. Returns one entry per dataset in input order, each with the same structure `predict` would return for that dataset. Datasets must share array shapes; constant-target datasets are answered analytically.
+
+  Both batched methods now raise `NotImplementedError` for `inference_precision=torch.float64` instead of silently computing the fused forward at float32 and returning float32-precision results. ([#1164](https://github.com/PriorLabs/TabPFN/pull/1164))
+- Add an attention-backend registry; the in-tree FA3/torch-MPS/MLX paths now route through it. Behavior unchanged unless a backend is registered. ([#1165](https://github.com/PriorLabs/TabPFN/pull/1165))
+- Add a test that `enable_torch_compile` traces tabpfn without graph breaks. ([#1166](https://github.com/PriorLabs/TabPFN/pull/1166))
+
+### Changed
+
+- Speed up cached prediction on Hopper GPUs with FlashAttention-3 installed, by splitting attention over the key/value sequence when few test rows attend over a large training cache. ([#1168](https://github.com/PriorLabs/TabPFN/pull/1168))
+- `n_estimators` now defaults to `"auto"` on `TabPFNClassifier` and `TabPFNRegressor`. Feature-coverage auto-scaling (raising `n_estimators` on wide datasets so every feature is seen by some estimator) applies only to `"auto"` — an explicitly passed `n_estimators` is always used exactly as given, and warns at fit time if it is too small for every feature to be covered. ([#1171](https://github.com/PriorLabs/TabPFN/pull/1171))
+
+### Fixed
+
+- Fix activation checkpointing during v2, v2.5, and v2.6 fine-tuning after the state-container memory optimization. ([#1138](https://github.com/PriorLabs/TabPFN/pull/1138))
+- - Fixed `fit()` crashing during temperature calibration or threshold tuning
+    (`tuning_config`) when a rare class is absent from the tuning holdout, by
+    passing the full label set to `log_loss` explicitly.
+  - Fixed `fit()` crashing when `random_state` is a `np.random.Generator` and
+    tuning is enabled, by converting the generator to a static seed before it
+    reaches `StratifiedKFold`.
+
+  ([#1140](https://github.com/PriorLabs/TabPFN/pull/1140))
+- fixed the randomness in the truncated SVD to make runs more reproducible. ([#1167](https://github.com/PriorLabs/TabPFN/pull/1167))
+- Fixed the many class decoder to only work with the relevant class count. ([#1175](https://github.com/PriorLabs/TabPFN/pull/1175))
+- Skip the Claude code review workflow on bot-authored release PRs, which previously failed the `claude-review` check on every release. ([#1177](https://github.com/PriorLabs/TabPFN/pull/1177))
+
+### Deprecated
+
+- `auto_scale_n_estimators` is deprecated and will be removed in v9. It only ever applied to `n_estimators="auto"`, where `auto_scale_n_estimators=False` is equivalent to passing `n_estimators=8`; pass an explicit `n_estimators` instead to opt out of feature-coverage scaling. Passing `False` now emits a `FutureWarning` at fit time. ([#1171](https://github.com/PriorLabs/TabPFN/pull/1171))
+
+
 ## [8.2.0] - 2026-07-28
 
 ### Added

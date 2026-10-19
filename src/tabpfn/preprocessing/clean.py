@@ -18,7 +18,10 @@ from packaging.version import Version
 
 from tabpfn.constants import NA_PLACEHOLDER
 from tabpfn.preprocessing.datamodel import FeatureModality
-from tabpfn.preprocessing.steps.preprocessing_helpers import get_ordinal_encoder
+from tabpfn.preprocessing.steps.preprocessing_helpers import (
+    get_ordinal_encoder,
+    to_numpy_may_alias,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -29,13 +32,152 @@ if TYPE_CHECKING:
     )
     from tabpfn.preprocessing.torch import FeatureSchema
 
+# An array's dtype is told apart by numpy's one-letter dtype kind:
 # https://numpy.org/doc/2.1/reference/arrays.dtypes.html#checking-the-data-type
 
+# `?` bool, `b` signed byte, `B` unsigned byte, `i` signed integer, `u` unsigned
+# integer, `f` float, `m` timedelta.
 NUMERIC_DTYPE_KINDS = "?bBiufm"
-OBJECT_DTYPE_KINDS = "OV"
-STRING_DTYPE_KINDS = "SaU"
-UNSUPPORTED_DTYPE_KINDS = "cM"  # Not needed, just for completeness
-PANDAS_FASTER_THAN_MIXED_PATH = Version(pd.__version__) < Version("3.0.0")
+# The subset of the above that numpy casts to float64 the same way pandas does, so
+# a frame need not be built to convert it. Timedeltas ("m") are excluded: pandas
+# converts those through its own units rather than numpy's raw integers.
+FAST_CONVERTIBLE_DTYPE_KINDS = "?bBiuf"
+# `O` object, `V` void (structured records), `U` fixed-width unicode strings, `T`
+# variable-width unicode strings (numpy 2's `StringDType`): pandas reads the cells to
+# work out each column's dtype.
+OBJECT_OR_STRING_DTYPE_KINDS = "OVUT"
+# `S` fixed-width byte strings and `a`, its legacy alias: refused.
+BYTES_DTYPE_KINDS = "Sa"
+# `c` complex, `M` datetime64. Not needed, just for completeness.
+UNSUPPORTED_DTYPE_KINDS = "cM"
+PANDAS_BELOW_3 = Version(pd.__version__) < Version("3.0.0")
+# Before 3.0 `astype` copies every column by default, including the ones it is not
+# casting; from 3.0 copy-on-write makes the keyword a no-op and passing it warns.
+_ASTYPE_KEEPS_UNCAST_COLUMNS = {"copy": False} if PANDAS_BELOW_3 else {}
+
+
+def _cast_columns_share_a_block(
+    X: pd.DataFrame,
+    columns: pd.Index | Sequence[Any],
+) -> bool:
+    """Whether any of `columns` sits in a block that holds more than one column.
+
+    That would make assigning a cast back expensive: the block a column is deleted
+    from is rebuilt whole.
+    Since columns are assigned one at a time on pandas < 3, casting `c` columns
+    out of a block costs `c(c+1)/2` column copies.
+    """
+    try:
+        blocks = X._mgr.blocks
+        columns_in_block = np.zeros(X.shape[1], dtype=np.intp)
+        for block in blocks:
+            positions = block.mgr_locs.as_array
+            columns_in_block[positions] = len(positions)
+        cast_positions = X.columns.get_indexer_for(columns)
+    except (AttributeError, TypeError, ValueError, IndexError):
+        return True
+    return (
+        len(cast_positions) == 0
+        or (cast_positions < 0).any().item()
+        or (columns_in_block[cast_positions] > 1).any().item()
+    )
+
+
+def _cast_columns(
+    X: pd.DataFrame,
+    columns: pd.Index | Sequence[Any],
+    dtype: Any,
+) -> pd.DataFrame:
+    """Efficiently cast `columns` in `X` to `dtype`."""
+    if len(columns) == 0:
+        return X
+
+    if not _cast_columns_share_a_block(X, columns) and not X.columns.has_duplicates:
+        # this path uses less memory when available
+        # Copied shallowly to not copy the columns themselves:
+        X = X.copy(deep=False)
+        X[columns] = X[columns].astype(dtype)
+        return X
+
+    # NOTE: this path is there for pandas < 3 compatibility
+
+    # fallback: never costly in time
+    # cast only the columns that need to be:
+    return X.astype(dict.fromkeys(columns, dtype), **_ASTYPE_KEEPS_UNCAST_COLUMNS)
+
+
+def _is_plain_numeric_array(X: np.ndarray | pd.DataFrame) -> bool:
+    """Whether `X` is a numpy array of a dtype that casts straight to float64.
+
+    Such an array carries no dtype to infer, no category to map and no string
+    cell to NA-handle, so cleaning it is a single cast (`_cast_to_float64_table`)
+    provided nothing is encoded either.
+    """
+    return isinstance(X, np.ndarray) and X.dtype.kind in FAST_CONVERTIBLE_DTYPE_KINDS
+
+
+def _encoder_selects_nothing(
+    ord_encoder: OrderPreservingColumnTransformer | None,
+) -> bool:
+    """Whether a *fitted* encoder would leave every column alone.
+
+    Asked of the encoder rather than of the incoming frame's categorical indices,
+    because the two can disagree: a column detected as text is encoded at fit but
+    never appears in `indices_for(FeatureModality.CATEGORICAL)`, and a column that
+    was string at fit can arrive numeric at predict. Only the encoder knows what
+    it was fitted to touch.
+    """
+    return ord_encoder is None or not ord_encoder.selected_columns()
+
+
+def clean_data_transform(
+    X: np.ndarray | pd.DataFrame,
+    *,
+    cat_indices: Sequence[int | str] | None,
+    ord_encoder: OrderPreservingColumnTransformer | None,
+    passthrough_inf: bool = False,
+) -> np.ndarray:
+    """Clean data being predicted on, the way `clean_data` cleaned the training data.
+
+    The predict-time half of `clean_data`: the same dtype fixing and ordinal
+    encoding, driven by the encoder `clean_data` fitted rather than fitting one,
+    and taking the same single-cast shortcut when there is nothing to encode.
+
+    Args:
+        X: The data to clean.
+        cat_indices: Indices of the columns the encoder was fitted on.
+        ord_encoder: The encoder `clean_data` returned at fit time.
+        passthrough_inf: If True, +/-inf values are carried through the ordinal
+            encoding stage unchanged instead of crashing it.
+
+    Returns:
+        The cleaned data as a float64 array.
+    """
+    if constant_values := getattr(ord_encoder, "constant_values_", None):
+        # A column constant at fit gets its fit-time value back, so it is cleaned
+        # exactly as at fit, whatever it holds at predict.
+        numeric = all(
+            isinstance(v, (int, float, np.number)) for v in constant_values.values()
+        )
+        # A copy either way: the caller's array must not be written to.
+        if not numeric:
+            X = X.astype(object)
+        else:
+            X = X.astype(X.dtype if X.dtype.kind in "fO" else np.float64)
+        for index, value in constant_values.items():
+            X[:, index] = value
+
+    if _is_plain_numeric_array(X) and _encoder_selects_nothing(ord_encoder):
+        # `passthrough_inf` makes no difference here: it records the +/-inf cells,
+        # NaNs them so the encoder does not choke, and writes them back at the same
+        # positions afterwards -- an exact round trip when nothing is encoded.
+        return X
+
+    return process_text_na_dataframe(
+        X=fix_dtypes(X=X, cat_indices=cat_indices),
+        ord_encoder=ord_encoder,
+        passthrough_inf=passthrough_inf,
+    )
 
 
 def clean_data(
@@ -57,16 +199,32 @@ def clean_data(
         A tuple containing the cleaned data, the ordinal encoder, and the inferred
         feature modalities.
     """
-    # Will convert inferred categorical indices to category dtype,
-    # to be picked up by the ord_encoder, as well
-    # as handle `np.object` arrays or otherwise `object` dtype pandas columns.
-    X_pandas: pd.DataFrame = fix_dtypes(
-        X=X,
-        cat_indices=feature_schema.indices_for(FeatureModality.CATEGORICAL),
-    )
+    cat_indices = feature_schema.indices_for(FeatureModality.CATEGORICAL)
 
     # Ensure categories are ordinally encoded
     ord_encoder = get_ordinal_encoder()
+    # Restored by `clean_data_transform`, so these columns carry no information at
+    # predict and never meet a value, e.g. a string, that fit did not see.
+    ord_encoder.constant_values_ = {  # type: ignore[attr-defined]
+        index: X[0, index]
+        for index in feature_schema.indices_for(FeatureModality.CONSTANT)
+    }
+
+    if not cat_indices and _is_plain_numeric_array(X):
+        # A numeric array holds no string cell, so with no categorical column
+        # declared there is nothing for the encoder to select.
+        #
+        # The encoder is still fit, since the caller keeps it for predict, but on a
+        # single row: with no column selected it learns nothing from the values,
+        # only the column bookkeeping.
+        ord_encoder.fit(fix_dtypes(X=X[:1], cat_indices=cat_indices))
+        return X, ord_encoder, feature_schema
+
+    # Will convert inferred categorical indices to category dtype,
+    # to be picked up by the ord_encoder, as well
+    # as handle `np.object` arrays or otherwise `object` dtype pandas columns.
+    X_pandas: pd.DataFrame = fix_dtypes(X=X, cat_indices=cat_indices)
+
     X_numpy = process_text_na_dataframe(
         X=X_pandas,
         ord_encoder=ord_encoder,
@@ -89,19 +247,20 @@ def coerce_nullable_dtypes_to_numpy(X: pd.DataFrame) -> pd.DataFrame:
 
     ``category``/``string``/``object`` columns are left untouched.
     """
-    cols = [
-        col
-        for col, dtype in X.dtypes.items()
+    dtypes = X.dtypes
+    # Decided once per distinct dtype rather than once per column: a wide frame has
+    # thousands of columns and a handful of dtypes.
+    dtypes_to_cast = {
+        dtype
+        for dtype in dtypes.unique()
         if pd.api.types.is_bool_dtype(dtype)
         or (pd.api.types.is_extension_array_dtype(dtype) and dtype.kind in "iuf")
-    ]
-    if cols:
-        X = X.copy()
-        X[cols] = X[cols].astype("float64")
-    return X
+    }
+    cols = [col for col, dtype in dtypes.items() if dtype in dtypes_to_cast]
+    return _cast_columns(X, cols, "float64")
 
 
-def fix_dtypes(  # noqa: D103, C901, PLR0912
+def fix_dtypes(  # noqa: D103
     X: pd.DataFrame | np.ndarray,
     cat_indices: Sequence[int | str] | None,
     numeric_dtype: Literal["float32", "float64"] = "float64",
@@ -114,14 +273,14 @@ def fix_dtypes(  # noqa: D103, C901, PLR0912
             # It's a numeric type, just wrap the array in pandas with the correct dtype
             X = pd.DataFrame(X, copy=False, dtype=numeric_dtype)
             convert_dtype = False
-        elif X.dtype.kind in OBJECT_DTYPE_KINDS:
-            # If numpy and object dtype, we rely on pandas to handle introspection
-            # of columns and rows to determine the dtypes.
+        elif X.dtype.kind in OBJECT_OR_STRING_DTYPE_KINDS:
+            # For an object or string array we rely on pandas to introspect the
+            # cells and determine each column's dtype.
             X = pd.DataFrame(X, copy=True)
             convert_dtype = True
-        elif X.dtype.kind in STRING_DTYPE_KINDS:
+        elif X.dtype.kind in BYTES_DTYPE_KINDS:
             raise ValueError(
-                f"String dtypes are not supported. Got dtype: {X.dtype}",
+                f"Byte string dtypes are not supported. Got dtype: {X.dtype}",
             )
         else:
             raise ValueError(f"Invalid dtype for X: {X.dtype}")
@@ -143,9 +302,9 @@ def fix_dtypes(  # noqa: D103, C901, PLR0912
         use_col_names = is_numeric_indices and not columns_are_numeric
         if use_col_names:
             cat_col_names = [X.columns[i] for i in cat_indices]
-            X[cat_col_names] = X[cat_col_names].astype("category")
+            X = _cast_columns(X, cat_col_names, "category")
         else:
-            X[cat_indices] = X[cat_indices].astype("category")
+            X = _cast_columns(X, cat_indices, "category")
 
     # Alright, pandas can have a few things go wrong.
     #
@@ -169,12 +328,19 @@ def fix_dtypes(  # noqa: D103, C901, PLR0912
         # `object` at fit (-> passthrough) but `string` at predict; the frozen
         # passthrough then lets raw strings reach the float cast below and crash.
         object_columns = X.select_dtypes(include=["object"]).columns
-        if len(object_columns) > 0:
-            X[object_columns] = X[object_columns].astype("string")
+        X = _cast_columns(X, object_columns, "string")
 
     numerical_columns = X.select_dtypes(include=["number"]).columns
-    if len(numerical_columns) > 0:
-        X[numerical_columns] = X[numerical_columns].astype(numeric_dtype)
+    # Assigning the numeric columns back is not free even when the cast is a no-op:
+    # it rewrites them as one block per column, and a fragmented frame has to be
+    # re-materialised (a full extra copy) by every later `to_numpy`. Skip it when
+    # they already hold the target dtype -- the common case for a numeric ndarray
+    # input, whose DataFrame was constructed with `numeric_dtype` above.
+    if (
+        len(numerical_columns) > 0
+        and not (X.dtypes[numerical_columns] == np.dtype(numeric_dtype)).all()
+    ):
+        X = _cast_columns(X, numerical_columns, numeric_dtype)
     return X
 
 
@@ -223,10 +389,7 @@ def _align_columns_to_fitted_dtypes(
     encoder = ord_encoder.named_transformers_.get("encoder")
     if encoder is None or not hasattr(encoder, "categories_"):
         return X
-    selected = next(
-        (cols for name, _, cols in ord_encoder.transformers_ if name == "encoder"),
-        [],
-    )
+    selected = ord_encoder.selected_columns()
     to_string, to_numeric = [], []
     for col, categories in zip(selected, encoder.categories_, strict=True):
         fit_kind = categories.dtype.kind
@@ -362,10 +525,7 @@ def _inf_masks_dataframe(X: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     return _inf_masks_mixed(X)
 
 
-if PANDAS_FASTER_THAN_MIXED_PATH:
-    inf_masks_dataframe = _inf_masks_pandas_only
-else:
-    inf_masks_dataframe = _inf_masks_dataframe
+inf_masks_dataframe = _inf_masks_pandas_only if PANDAS_BELOW_3 else _inf_masks_dataframe
 
 
 def process_text_na_dataframe(
@@ -418,12 +578,27 @@ def process_text_na_dataframe(
             X = X.copy()
         X[string_cols] = X[string_cols].fillna(placeholder)
 
-    if fit_encoder and ord_encoder is not None:
-        X_encoded = ord_encoder.fit_transform(X)
-    elif ord_encoder is not None:
-        X_encoded = ord_encoder.transform(X)
-    else:
+    if ord_encoder is None:
+        # No encoding step at all, so the frame's own values are the output. Copied
+        # where `to_numpy` may hand back one of the frame's blocks rather than a private
+        # array, since the writes below are the caller's to make; taken as it is
+        # otherwise, which costs the one full-size buffer either way.
         X_encoded = X.to_numpy()
+        if to_numpy_may_alias(X):
+            X_encoded = X_encoded.copy(order="K")
+    elif fit_encoder:
+        X_encoded = ord_encoder.fit_transform(X)
+    else:
+        X_encoded = ord_encoder.transform(X)
+
+    # Everything below writes into this array and then hands it to the caller, so it
+    # has to be one no one else holds. Read-only means pandas handed back a view of a
+    # frame's block instead, and note that on pandas 2 such a view is writeable and
+    # would pass this while quietly writing through to whatever the frame was built
+    # from.
+    assert X_encoded.flags.writeable, (
+        "the ordinal-encoding step returned an array it does not own"
+    )
 
     string_cols_ix = [X.columns.get_loc(col) for col in string_cols]
     placeholder_mask = X[string_cols] == placeholder
@@ -432,7 +607,10 @@ def process_text_na_dataframe(
         np.nan,
         X_encoded[:, string_cols_ix],
     )
-    X_encoded = X_encoded.astype(np.float64)
+    # `copy=False` because the cast has nothing to do whenever the step above already
+    # produced float64.
+    # Safe to hand back uncopied because every branch above allocates its own array.
+    X_encoded = X_encoded.astype(np.float64, copy=False)
 
     # Write the recorded +/-inf values back into their original numeric cells.
     if passthrough_inf and (pos_inf.any() or neg_inf.any()):

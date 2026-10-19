@@ -35,7 +35,7 @@ class TabPFNSettings(BaseSettings):
         "If not set, uses platform-specific user cache directory.",
     )
     model_version: ModelVersion = Field(
-        default=ModelVersion.V3,
+        default=ModelVersion.V3_5,
         description="The version of the TabPFN model to use by default.",
     )
 
@@ -68,6 +68,25 @@ class TabPFNSettings(BaseSettings):
         "forward pass during cached ('fit_with_cache') inference. Larger test sets "
         "are chunked. Performance is close to optimal at the default of 32768. "
         "Set to 0 to disable chunking.",
+    )
+    max_batched_estimator_rows: int | None = Field(
+        default=None,
+        ge=0,
+        description="Overrides the model's row budget for batching estimators: "
+        "estimators whose rows (train plus test, or test only when predicting from "
+        "a KV cache) sum to at most this many run as one forward pass; longer "
+        "contexts run one estimator at a time. Unset, each architecture applies its "
+        "own default. Set to 0 to run every estimator in its own forward pass and "
+        "its own cache.",
+    )
+    max_batched_estimator_cells: int | None = Field(
+        default=None,
+        ge=0,
+        description="Overrides the model's cell budget for batching estimators: "
+        "estimators whose cells (rows times prepared columns) sum to at most this "
+        "many run as one forward pass. Applies together with the row budget. Unset, "
+        "each architecture applies its own default. Set to 0 to run every estimator "
+        "in its own forward pass and its own cache.",
     )
 
     def model_post_init(self, _: Any) -> None:

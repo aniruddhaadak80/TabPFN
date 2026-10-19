@@ -18,7 +18,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -36,6 +36,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from tabpfn.architectures.interface import PerformanceOptions
+from tabpfn.architectures.tabpfn_v3_5 import TabPFNV3p5
 from tabpfn.finetuning._torch_compat import GradScaler, autocast, sdpa_kernel_context
 from tabpfn.finetuning.data_util import (
     ClassifierBatch,
@@ -52,12 +53,16 @@ from tabpfn.finetuning.train_util import (
 )
 from tabpfn.settings import settings
 from tabpfn.utils import infer_devices, infer_random_state
-from tabpfn.validation import ensure_compatible_fit_inputs_sklearn
+from tabpfn.validation import (
+    check_input_shape_matches,
+    ensure_compatible_fit_inputs_sklearn,
+    extract_input_shape,
+)
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from tabpfn.constants import ModelVersion, XType, YType
+    from tabpfn.constants import ModelVersion, TaskType, XType, YType
 
 # Currently, we only support a batch size of 1 for finetuning.
 META_BATCH_SIZE = 1
@@ -224,6 +229,28 @@ def _ratio_ctx_query_split(
         )
 
 
+def _parameters_unused_by_task(
+    model: torch.nn.Module,
+    task_type: TaskType,
+) -> list[torch.nn.Parameter]:
+    """Parameters that a forward pass for ``task_type`` never touches.
+
+    A multitask checkpoint (v3.5) holds one target encoder and head per task in
+    a single module, so fine-tuning one task leaves the other's parameters
+    without a gradient. Single-task architectures have none and return ``[]``.
+    """
+    if not isinstance(model, TabPFNV3p5):
+        return []
+    if task_type == "multiclass":
+        other = "regression"
+        heads = [model.heads.mlp_regression, model.heads.output_projection]
+    else:
+        other = "multiclass"
+        heads = [model.heads.mlp_classification, model.heads.many_class_decoder]
+    modules = [model.col_y_encoder[other], model.icl_y_encoder[other], *heads]
+    return [p for m in modules for p in m.parameters()]
+
+
 class _TabPFNDDPWrapper(torch.nn.Module):
     """Thin wrapper that registers estimator.model_ as a submodule for DDP."""
 
@@ -234,6 +261,77 @@ class _TabPFNDDPWrapper(torch.nn.Module):
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.estimator.forward(*args, **kwargs)
+
+
+@dataclass(frozen=True)
+class _EstimatorShard:
+    """Contiguous estimator shard assigned to one distributed rank."""
+
+    start: int
+    stop: int
+    total_estimators: int
+    world_size: int
+
+    @property
+    def size(self) -> int:
+        """Number of estimators handled by this rank."""
+        return self.stop - self.start
+
+    @property
+    def gradient_scale(self) -> float:
+        """Scale local mean loss so DDP's rank mean equals the global mean."""
+        return self.world_size * self.size / self.total_estimators
+
+
+def _get_estimator_shard(
+    total_estimators: int, rank: int, world_size: int
+) -> _EstimatorShard:
+    """Split estimators as evenly as possible into non-empty rank shards."""
+    if world_size < 1:
+        raise ValueError(f"world_size must be positive; got {world_size}.")
+    if not 0 <= rank < world_size:
+        raise ValueError(f"rank must be in [0, {world_size}); got {rank}.")
+    if total_estimators < world_size:
+        raise ValueError(
+            "Estimator sharding requires n_estimators_finetune >= world_size; "
+            f"got {total_estimators} estimators and {world_size} ranks."
+        )
+    base, remainder = divmod(total_estimators, world_size)
+    start = rank * base + min(rank, remainder)
+    stop = start + base + int(rank < remainder)
+    return _EstimatorShard(start, stop, total_estimators, world_size)
+
+
+def _slice_batch_estimators(
+    batch: ClassifierBatch | RegressorBatch,
+    shard: _EstimatorShard,
+) -> ClassifierBatch | RegressorBatch:
+    """Keep only this rank's estimator inputs in a collated fine-tuning batch."""
+    estimator_slice = slice(shard.start, shard.stop)
+    # After meta_dataset_collator, cat_indices is [dataset batch][estimator][column].
+    cat_indices = [items[estimator_slice] for items in batch.cat_indices]
+    return replace(
+        batch,
+        X_context=batch.X_context[estimator_slice],
+        X_query=batch.X_query[estimator_slice],
+        y_context=batch.y_context[estimator_slice],
+        cat_indices=cat_indices,
+        configs=batch.configs[estimator_slice],
+    )
+
+
+def _get_loss_for_logging(
+    loss: torch.Tensor,
+    estimator_shard: _EstimatorShard | None,
+) -> float:
+    """Return the global estimator-mean loss without changing its gradients."""
+    loss_for_logging = loss.detach()
+    if estimator_shard is not None:
+        # ``loss`` includes the DDP gradient-correction scale. Its rank mean is
+        # therefore the global estimator mean, including for uneven shards.
+        loss_for_logging = loss_for_logging / estimator_shard.world_size
+        dist.all_reduce(loss_for_logging, op=dist.ReduceOp.SUM)
+    return float(loss_for_logging.item())
 
 
 @dataclass
@@ -322,6 +420,11 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             Defaults to 2.
         use_activation_checkpointing: Whether to use activation checkpointing to
             reduce memory usage. Defaults to True.
+        shard_estimators_across_gpus: When True under DDP, every rank processes the
+            same data chunk but only a shard of the fine-tuning estimators. DDP then
+            averages gradients across estimator shards. This reduces per-rank
+            activation memory instead of only distributing data chunks. Defaults to
+            False.
         save_checkpoint_interval: Number of epochs between checkpoint saves. This
             only has an effect if `output_dir` is provided during the `fit()` call.
             If None, no intermediate checkpoints are saved. The best model checkpoint
@@ -366,6 +469,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         n_estimators_validation: int = 2,
         n_estimators_final_inference: int = 2,
         use_activation_checkpointing: bool = True,
+        shard_estimators_across_gpus: bool = False,
         save_checkpoint_interval: int | None = 10,
         use_fixed_preprocessing_seed: bool = True,
         experiment_logger: FinetuningLogger | None = None,
@@ -395,10 +499,13 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         self.n_estimators_validation = n_estimators_validation
         self.n_estimators_final_inference = n_estimators_final_inference
         self.use_activation_checkpointing = use_activation_checkpointing
+        self.shard_estimators_across_gpus = shard_estimators_across_gpus
         self.save_checkpoint_interval = save_checkpoint_interval
         self.meta_batch_size = META_BATCH_SIZE
         self.use_fixed_preprocessing_seed = use_fixed_preprocessing_seed
         self._ddp_module_: DistributedDataParallel | None = None
+        self._local_n_estimators_ = n_estimators_finetune
+        self._estimator_gradient_scale_ = 1.0
 
         if self.use_fixed_preprocessing_seed and not (
             self.n_estimators_finetune
@@ -437,6 +544,12 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         config = copy.deepcopy(base_config)
         existing_inference_config = dict(config.get("inference_config", {}) or {})
         existing_inference_config["ENABLE_GPU_PREPROCESSING"] = False
+        # The training loop hands the model numpy arrays, which the text and date
+        # transformers never touch, so the estimators built here must not run them
+        # either: otherwise the final model would see features the weights were
+        # not tuned on.
+        existing_inference_config["TRANSFORM_TEXT"] = False
+        existing_inference_config["TRANSFORM_DATES"] = False
         config["inference_config"] = existing_inference_config
         if n_estimators_override is not None:
             config["n_estimators"] = n_estimators_override
@@ -481,11 +594,6 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
     @abstractmethod
     def _create_estimator(self, config: dict[str, Any]) -> Any:
         """Create and return the underlying TabPFN estimator with the given config."""
-        ...
-
-    @abstractmethod
-    def _setup_estimator(self) -> None:
-        """Perform any task-specific setup after estimator creation."""
         ...
 
     @abstractmethod
@@ -677,6 +785,32 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
         if using_ddp:
             self.device = device_str
 
+        self._local_n_estimators_ = self.n_estimators_finetune
+        self._estimator_gradient_scale_ = 1.0
+        estimator_shard: _EstimatorShard | None = None
+        if self.shard_estimators_across_gpus:
+            if not using_ddp:
+                warnings.warn(
+                    "`shard_estimators_across_gpus=True` has no effect without DDP.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                estimator_shard = _get_estimator_shard(
+                    self.n_estimators_finetune,
+                    dist.get_rank(),
+                    dist.get_world_size(),
+                )
+                self._local_n_estimators_ = estimator_shard.size
+                self._estimator_gradient_scale_ = estimator_shard.gradient_scale
+                logger.info(
+                    "Rank %d fine-tuning estimator shard [%d:%d] of %d",
+                    dist.get_rank(),
+                    estimator_shard.start,
+                    estimator_shard.stop,
+                    estimator_shard.total_estimators,
+                )
+
         _logger = self.experiment_logger or NullLogger()
         global_step = 0
 
@@ -754,16 +888,13 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 finetuning_estimator_config["model_path"] = checkpoint_path
 
         self.finetuned_estimator_ = self._create_estimator(finetuning_estimator_config)
-        self._setup_estimator()
-
         self.finetuned_estimator_._initialize_model_variables()
-        X_validated, y_validated, self.feature_names_in_, self.n_features_in_ = (
-            ensure_compatible_fit_inputs_sklearn(
-                X,
-                y,
-                estimator=self.finetuned_estimator_,
-                ensure_y_numeric=self._model_type == "regressor",
-            )
+        self.feature_names_in_, self.n_features_in_ = extract_input_shape(X)
+        X_validated, y_validated = ensure_compatible_fit_inputs_sklearn(
+            X,
+            y,
+            estimator=self.finetuned_estimator_,
+            ensure_y_numeric=self._model_type == "regressor",
         )
         self.X_ = X
         self.y_ = y
@@ -771,7 +902,10 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
 
         if X_val is not None and y_val is not None:
             X_train, y_train = X, y
-            X_val, y_val, _, _ = ensure_compatible_fit_inputs_sklearn(
+            # The validation set has to match the shape the training set recorded
+            # above, not replace it.
+            check_input_shape_matches(X_val, estimator=self)
+            X_val, y_val = ensure_compatible_fit_inputs_sklearn(
                 X_val,
                 y_val,
                 estimator=self.finetuned_estimator_,
@@ -819,6 +953,14 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             force_recompute_layer=self.use_activation_checkpointing,
             use_chunkwise_inference=False,
         )
+
+        # Freeze the other task's parameters of a multitask checkpoint before
+        # wrapping in DDP, so it does not wait for gradients that never come.
+        task_type = "multiclass" if self._model_type == "classifier" else "regression"
+        for param in _parameters_unused_by_task(
+            self.finetuned_estimator_.model_, task_type
+        ):
+            param.requires_grad = False
 
         # --- DDP model wrapping ---
         model_for_optimization = self.finetuned_estimator_.model_
@@ -903,6 +1045,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             y_train=y_train,
         )
         for epoch in range(epoch_to_start_from, self.epochs):
+            epoch_start_time = _synchronize_epoch_timer()
             # Per-epoch aggregates for cleaner learning curves.
             epoch_loss_sum = 0.0
             epoch_batches = 0
@@ -929,7 +1072,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 preprocessing_random_state=preprocessing_random_state,
             )
 
-            if using_ddp:
+            if using_ddp and estimator_shard is None:
                 sampler = DistributedSampler(
                     training_datasets,
                     num_replicas=dist.get_world_size(),
@@ -945,6 +1088,8 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                     sampler=sampler,
                 )
             else:
+                # Estimator sharding requires identical data and ordering on every
+                # rank; only the estimator dimension differs between ranks.
                 dataloader_generator = torch.Generator().manual_seed(epoch_random_state)
                 finetuning_dataloader = DataLoader(
                     training_datasets,
@@ -1003,7 +1148,16 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             for batch in progress_bar:
                 optimizer.zero_grad()
 
+                # Decide whether to skip from the complete estimator ensemble.
+                # Classifier context labels may be permuted per estimator, so a
+                # rank-local shard alone does not preserve the original check's
+                # union-of-labels semantics.
                 should_skip = self._should_skip_batch(batch)
+                rank_batch = (
+                    _slice_batch_estimators(batch, estimator_shard)
+                    if estimator_shard is not None
+                    else batch
+                )
                 if using_ddp:
                     # All ranks must agree — if any rank skips, all skip,
                     # otherwise DDP all-reduce in backward will deadlock.
@@ -1013,13 +1167,13 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 if should_skip:
                     continue
 
-                self._setup_batch(batch)
+                self._setup_batch(rank_batch)
 
                 self.finetuned_estimator_.fit_from_preprocessed(
-                    batch.X_context,
-                    batch.y_context,
-                    batch.cat_indices,
-                    batch.configs,
+                    rank_batch.X_context,
+                    rank_batch.y_context,
+                    rank_batch.cat_indices,
+                    rank_batch.configs,
                     performance_options=finetuning_performance_options,
                 )
 
@@ -1031,7 +1185,11 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 use_scaler = use_amp and scaler is not None
 
                 with autocast(enabled=use_scaler), sdpa_kernel_context():  # type: ignore
-                    loss = self._forward_with_loss(batch)
+                    loss = self._forward_with_loss(rank_batch)
+                    # DDP averages rank gradients. Correct the local estimator-mean
+                    # loss so that uneven shards still produce the global
+                    # estimator-mean gradient after that averaging.
+                    loss = loss * self._estimator_gradient_scale_
 
                 if use_scaler:
                     with sdpa_kernel_context():
@@ -1061,7 +1219,7 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
                 if scheduler is not None:
                     scheduler.step()
 
-                loss_scalar = float(loss.detach().item())
+                loss_scalar = _get_loss_for_logging(loss, estimator_shard)
 
                 epoch_loss_sum += loss_scalar
                 epoch_batches += 1
@@ -1101,6 +1259,15 @@ class FinetunedTabPFNBase(BaseEstimator, ABC):
             mean_train_loss = (
                 epoch_loss_sum / epoch_batches if epoch_batches > 0 else None
             )
+            epoch_train_time = time.monotonic() - epoch_start_time
+            if is_main_process:
+                logger.info(
+                    "Fine-tuning epoch %d/%d took %.2fs (%d batches across ranks)",
+                    epoch + 1,
+                    self.epochs,
+                    epoch_train_time,
+                    epoch_batches,
+                )
 
             # --- Validation (rank 0 only), broadcast metric ---
             run_validation = do_validation and (epoch + 1) % validation_frequency == 0

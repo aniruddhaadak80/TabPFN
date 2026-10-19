@@ -21,9 +21,11 @@ import pytest
 import torch
 from sklearn.datasets import make_regression
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import FunctionTransformer
 from torch.utils.data import DataLoader
 
 from tabpfn.architectures.shared.bar_distribution import BarDistribution
+from tabpfn.constants import ModelVersion
 from tabpfn.finetuning.data_util import (
     RegressorBatch,
     get_preprocessed_dataset_chunks,
@@ -33,9 +35,11 @@ from tabpfn.finetuning.finetuned_base import EvalResult
 from tabpfn.finetuning.finetuned_regressor import (
     FinetunedTabPFNRegressor,
     _compute_regression_loss,
+    _targets_in_estimator_space,
 )
 from tabpfn.preprocessing import RegressorEnsembleConfig
 from tabpfn.regressor import TabPFNRegressor
+from tabpfn.settings import settings
 
 from .utils import (
     get_pytest_devices,
@@ -45,7 +49,25 @@ from .utils import (
 
 rng = np.random.default_rng(42)
 
+
+@pytest.fixture(autouse=True)
+def _finetune_the_v3_5_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the fine-tuning tests against the multitask v3.5 architecture.
+
+    The fast variant shares the architecture class and is cheaper on CI.
+    """
+    monkeypatch.setattr(settings.tabpfn, "model_version", ModelVersion.V3_5_FAST)
+
+
 devices = get_pytest_devices()
+
+
+@pytest.fixture(autouse=True)
+def _finetune_the_fast_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fine-tuning holds the base model, its fine-tuned copy and the optimizer
+    state at once; the fast checkpoint keeps that within the CI runners' memory.
+    """
+    monkeypatch.setattr(settings.tabpfn, "model_version", ModelVersion.V3_5_FAST)
 
 
 def create_mock_architecture_forward_regression() -> Callable[..., torch.Tensor]:
@@ -85,7 +107,9 @@ def create_mock_architecture_forward_regression() -> Callable[..., torch.Tensor]
         first_param = next(self.parameters())
         param_contribution = 0.0 * first_param.sum()
 
-        n_out = int(getattr(self, "n_out", 1))
+        # v3 exposes the bar count as `n_out`; the multitask v3.5 model only
+        # carries the borders.
+        n_out = getattr(self, "n_out", None) or self.regression_borders.numel() - 1
         return (
             torch.randn(
                 num_test_rows,
@@ -213,7 +237,7 @@ def test__finetuned_tabpfn_regressor__fit_and_predict(
 
     mock_forward = create_mock_architecture_forward_regression()
     with mock.patch(
-        "tabpfn.architectures.tabpfn_v3.TabPFNV3.forward",
+        "tabpfn.architectures.tabpfn_v3_5.TabPFNV3p5.forward",
         autospec=True,
         side_effect=mock_forward,
     ):
@@ -271,7 +295,7 @@ def test__regressor_checkpoint_contains_mse_metric(
     mock_forward = create_mock_architecture_forward_regression()
     with (
         mock.patch(
-            "tabpfn.architectures.tabpfn_v3.TabPFNV3.forward",
+            "tabpfn.architectures.tabpfn_v3_5.TabPFNV3p5.forward",
             autospec=True,
             side_effect=mock_forward,
         ),
@@ -296,6 +320,18 @@ def test__regressor_checkpoint_contains_mse_metric(
     assert "mse" in best_checkpoint
     assert "roc_auc" not in best_checkpoint
     assert "log_loss" not in best_checkpoint
+
+
+def test__targets_in_estimator_space__applies_the_estimator_target_transform() -> None:
+    """Members with a target transform are scored on transformed targets."""
+    y = torch.tensor([0.5, -1.0, 2.0])
+
+    plain = _targets_in_estimator_space(y, mock.Mock(target_transform=None))
+    assert plain is y
+
+    negate = FunctionTransformer(lambda x: -x)
+    transformed = _targets_in_estimator_space(y, mock.Mock(target_transform=negate))
+    torch.testing.assert_close(transformed, -y)
 
 
 def test__compute_regression_loss__correct_mse_and_mae_with_nan_targets() -> None:
@@ -429,6 +465,48 @@ def test__compute_regression_loss__rps_vs_rls_matches_expected_value() -> None:
         mae_loss_clip=None,
     )
     assert combined_loss.item() == pytest.approx(expected_rps + expected_rls)
+
+
+@pytest.mark.parametrize(
+    "loss_weights",
+    [
+        {"ce_loss_weight": 1.0},
+        {"crps_loss_weight": 1.0},
+        {"crls_loss_weight": 1.0},
+        {"mse_loss_weight": 1.0},
+        {"mae_loss_weight": 1.0},
+        {"ce_loss_weight": 1.0, "crps_loss_weight": 1.0, "crls_loss_weight": 1.0},
+    ],
+)
+def test__compute_regression_loss__reduces_every_term_to_a_scalar(
+    loss_weights: dict[str, float],
+) -> None:
+    """Every term must be reduced before it is summed into the total.
+
+    `ranked_probability_score_loss_from_bar_logits` returns one loss per query, so a
+    term that forgets `.mean()` broadcasts `total_loss` to (B, Q) and `backward()`
+    fails. More than one query is essential here: with Q=1 an unreduced term still
+    holds a single element, so `.item()` succeeds and hides the missing reduction.
+    """
+    borders = torch.linspace(-2.0, 2.0, steps=9, dtype=torch.float32)
+    bardist_loss_fn = BarDistribution(borders=borders, ignore_nan_targets=True)
+    torch.manual_seed(0)
+    logits_BQL = torch.randn(
+        (2, 3, bardist_loss_fn.num_bars), dtype=torch.float32, requires_grad=True
+    )
+    targets_BQ = torch.tensor([[0.5, -1.0, 1.5], [-0.5, 1.0, 0.25]])
+
+    total_loss = _compute_regression_loss(
+        logits_BQL=logits_BQL,
+        targets_BQ=targets_BQ,
+        bardist_loss_fn=bardist_loss_fn,
+        **{"ce_loss_weight": 0.0, **loss_weights},
+    )
+
+    assert total_loss.shape == ()
+    # The symptom a non-scalar total actually produces during finetuning.
+    total_loss.backward()
+    assert logits_BQL.grad is not None
 
 
 def test_regressor_dataset_and_collator_batches_type(

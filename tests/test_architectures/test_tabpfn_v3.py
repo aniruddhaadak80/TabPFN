@@ -19,7 +19,12 @@ from tabpfn.architectures.kv_cache import (
     KVCacheEntry,
     QuantizedKVCacheEntry,
 )
+from tabpfn.architectures.shared.attention_backends import (
+    register_attention_backend,
+    unregister_attention_backend,
+)
 from tabpfn.architectures.tabpfn_v3 import TabPFNV3Cache, get_cache_size
+from tabpfn.constants import ModelVersion
 from tabpfn.utils import get_autocast_context
 
 
@@ -34,7 +39,7 @@ def _get_model() -> tabpfn_v3.TabPFNV3:
         dist_embed_num_heads=3,
         feat_agg_num_heads=3,
     )
-    model = tabpfn_v3.get_architecture(config, cache_trainset_representation=False)
+    model = tabpfn_v3.get_architecture(config)
     model.to(torch.float32)
     return model
 
@@ -142,7 +147,8 @@ def test__many_class_decoder_attention_weights_matches_forward(
     test_emb = torch.randn(B, M, E)
     targets = torch.randint(0, max_num_classes, (B, N))
 
-    weights = decoder.attention_weights(train_emb, test_emb)
+    train_keys = decoder.project_keys(train_emb)
+    weights = decoder.attention_weights(train_keys, test_emb)
     assert weights.shape == (B, M, N)
     assert torch.all(weights >= 0)
     torch.testing.assert_close(weights.sum(-1), torch.ones(B, M))
@@ -151,7 +157,7 @@ def test__many_class_decoder_attention_weights_matches_forward(
     class_avg = torch.einsum("bmn,bnt->bmt", weights, one_hot)
     logits = torch.log(torch.clamp(class_avg, min=1e-5) + 3e-5).transpose(0, 1)
 
-    expected = decoder(train_emb, test_emb, targets)
+    expected = decoder(train_keys, test_emb, targets)
     torch.testing.assert_close(logits, expected, atol=1e-4, rtol=1e-4)
 
 
@@ -168,7 +174,7 @@ def test__mem_eff_forward_matches_standard_forward() -> None:
 
     # Memory-efficient path: small fixed chunk sizes to force chunking
     # even on this tiny dataset.
-    arch.inference_row_chunk_size = 50
+    arch.inference_chunk_cells = 50 * 2 * 20  # 50 rows of the (100, 2, 20) inputs
     arch.inference_col_chunk_size = 10
     output_mem_eff = arch(
         x,
@@ -212,7 +218,7 @@ def test__chunked_inference_recovers_from_oom(
     expected = arch(x, y, only_return_standard_out=False)
 
     # Force chunking so the inducing-hidden (column) recovery path is exercised.
-    arch.inference_row_chunk_size = 50
+    arch.inference_chunk_cells = 50 * 2 * 20  # 50 rows of the (100, 2, 20) inputs
     arch.inference_col_chunk_size = 10
 
     # Raise a single OOM the first time a column chunk is processed, so the
@@ -263,7 +269,7 @@ def _get_regression_model() -> tabpfn_v3.TabPFNV3:
         feat_agg_num_cls_tokens=2,
         dist_embed_num_inducing_points=8,
     )
-    model = tabpfn_v3.get_architecture(config, cache_trainset_representation=False)
+    model = tabpfn_v3.get_architecture(config)
     model.to(torch.float32)
     return model
 
@@ -288,7 +294,8 @@ def test__kv_cache__matches_standard_forward(use_chunkwise: bool) -> None:
 
     assert isinstance(cache, TabPFNV3Cache)
     assert not cache.is_empty()
-    assert cache.train_embeddings is not None
+    # Regression has no many-class decoder, so nothing is cached for it.
+    assert cache.decoder_keys is None
     assert len(cache.kv) == 2  # nlayers=2
 
     # Store-mode output matches standard
@@ -325,11 +332,11 @@ def test__kv_cache__multiclass_matches_standard() -> None:
 
 @torch.no_grad()
 def test__kv_cache__row_chunked_matches_unchunked() -> None:
-    """Cached forward with a small inference_row_chunk_size must match unchunked.
+    """Cached forward with a small inference_chunk_cells must match unchunked.
 
     Exercises the chunked branch of ``_forward_with_cache`` (R_test >
     row_chunk_size), which the existing cache tests don't hit because
-    ``inference_row_chunk_size="auto"`` short-circuits to a single chunk
+    a large ``inference_chunk_cells`` short-circuits to a single chunk
     on small R_test.
     """
     arch = _get_regression_model()
@@ -345,7 +352,7 @@ def test__kv_cache__row_chunked_matches_unchunked() -> None:
     _, cache = arch(x, y, performance_options=perf, return_kv_cache=True)
 
     # Force multi-chunk test-row processing: 10 test rows / 3 per chunk = 4 chunks
-    arch.inference_row_chunk_size = 3
+    arch.inference_chunk_cells = 3 * 5  # 3 rows of the 5-column inputs
     out_cached_chunked = arch(x, y, performance_options=perf, kv_cache=cache)
 
     assert torch.allclose(out_standard, out_cached_chunked, atol=1e-6), (
@@ -371,7 +378,7 @@ def test__kv_cache__gqa_matches_standard() -> None:
         feat_agg_num_cls_tokens=2,
         dist_embed_num_inducing_points=8,
     )
-    arch = tabpfn_v3.get_architecture(config, cache_trainset_representation=False)
+    arch = tabpfn_v3.get_architecture(config)
     arch.to(torch.float32)
 
     torch.manual_seed(42)
@@ -468,6 +475,42 @@ def test__kv_cache_entry__quantize_dequantize_roundtrip() -> None:
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("cache_dtype", [torch.int8, FP8_KV_DTYPE])
+def test__kv_cache__layerwise_quantization_matches_post_forward(
+    cache_dtype: torch.dtype,
+) -> None:
+    """Quantizing during construction produces the same cache as afterward."""
+    arch = _get_model()
+    torch.manual_seed(42)
+    x = torch.randn(20, 1, 5, dtype=torch.float32) * 0.1
+    y = torch.randint(0, 10, (10,), dtype=torch.float32)
+
+    _, full_precision = arch(x, y, return_kv_cache=True)
+    _, layerwise = arch(
+        x,
+        y,
+        return_kv_cache=True,
+        performance_options=PerformanceOptions(kv_cache_dtype=cache_dtype),
+    )
+    assert full_precision is not None
+    assert layerwise is not None
+    post_forward = full_precision.quantize(cache_dtype)
+
+    assert layerwise.decoder_keys.dtype == full_precision.decoder_keys.dtype
+    for layer_idx in post_forward.kv:
+        expected = post_forward.kv[layer_idx]
+        actual = layerwise.kv[layer_idx]
+        assert isinstance(expected, QuantizedKVCacheEntry)
+        assert isinstance(actual, QuantizedKVCacheEntry)
+        # torch.equal lacks CPU float8 support in the lowest supported PyTorch.
+        # Comparing after an exact float32 widening works for int8 and float8.
+        assert torch.equal(actual.key.float(), expected.key.float())
+        assert torch.equal(actual.value.float(), expected.value.float())
+        assert torch.equal(actual.key_scale, expected.key_scale)
+        assert torch.equal(actual.value_scale, expected.value_scale)
+
+
+@torch.no_grad()
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
 def test__kv_cache_entry__quantize_all_zero_is_finite(dtype: torch.dtype) -> None:
     """All-zero inputs must round-trip without NaN/Inf across float dtypes.
@@ -540,8 +583,8 @@ def test__quantized_kv_cache__close_to_standard_forward(use_chunkwise: bool) -> 
     for entry in q_cache.kv.values():
         assert isinstance(entry, QuantizedKVCacheEntry)
         assert entry.key.dtype == torch.int8
-    # Train embeddings stay in native dtype
-    assert q_cache.train_embeddings.dtype == torch.float32
+    # Regression caches no decoder keys.
+    assert q_cache.decoder_keys is None
 
     out_quantized = arch(x, y, performance_options=perf, kv_cache=q_cache)
 
@@ -575,9 +618,10 @@ def test__quantized_kv_cache__multiclass__close_to_standard_forward() -> None:
     for entry in q_cache.kv.values():
         assert isinstance(entry, QuantizedKVCacheEntry)
         assert entry.key.dtype == torch.int8
-    # Train embeddings stay in full precision
-    assert q_cache.train_embeddings is not None
-    assert q_cache.train_embeddings.dtype == torch.float32
+    # quantize() touches only the KV entries: the decoder keys keep the dtype they
+    # were computed at, which is fp32 here (fp32 model, no autocast context).
+    assert q_cache.decoder_keys is not None
+    assert q_cache.decoder_keys.dtype == torch.float32
 
     out_quantized = arch(x, y, kv_cache=q_cache)
 
@@ -682,7 +726,7 @@ def test__calculate_cache_size__matches_whole_classifier_cache_autocast(
     GPU).
 
     Unlike the forced-precision path, autocast keeps fp32 model weights and casts
-    ops at runtime -- matmul-lineage tensors (KV, and ``train_embeddings`` via its
+    ops at runtime -- matmul-lineage tensors (KV, and ``decoder_keys`` via its
     explicit cast to the KV dtype) become the 2-byte compute dtype, while
     reduction/norm-lineage tensors (``inducing_hidden``, ``scaler_cache``) stay
     fp32. ``get_cache_size(dtype="autocast")`` must size each term at its real
@@ -709,7 +753,7 @@ def test__calculate_cache_size__matches_whole_classifier_cache_autocast(
         n_train=n_train,
         n_features=n_features,
         model_config=cfg,
-        # "autocast": KV/train_embeddings sized at fp16, inducing/scaler at fp32.
+        # "autocast": KV/decoder_keys sized at fp16, inducing/scaler at fp32.
         base_dtype="autocast",
         kv_cache_precision=kv_cache_precision,
     )
@@ -724,10 +768,8 @@ def test__calculate_cache_size__matches_whole_regression_cache(
     """get_cache_size equals the exact byte size of every tensor in a real
     regression cache, across the engine's forced-precision dtypes.
 
-    Regression currently *stores* train_embeddings even though it never uses
-    them, so counting the full physical cache is correct today. If a future
-    change stops caching those for regression, this exact-equality assert breaks
-    -- signalling that get_cache_size should then drop that term for regression.
+    Regression has no many-class decoder, so its cache carries no ``decoder_keys``
+    term at all -- exact equality here is what pins that down.
     """
     arch = _get_regression_model()
     arch.type(dtype)  # mirror the engine's set_dtype for forced precision.
@@ -779,7 +821,7 @@ def test__calculate_cache_size__tabpfn3_classifier_1000_rows() -> None:
     """Pin calculate_cache_size for the real Prior-Labs/tabpfn_3 classifier at
     1,000 train rows (1 estimator, engine defaults: int8 KV, fp16 rest).
     """
-    clf = TabPFNClassifier()
+    clf = TabPFNClassifier.create_default_for_version(ModelVersion.V3)
     # Loads the checkpoint (config + weights) without needing fit data.
     clf._initialize_model_variables()
     config = clf.model_.config
@@ -795,7 +837,7 @@ def test__calculate_cache_size__tabpfn3_classifier_1000_rows() -> None:
     #   KV int8:            nlayers*2*H_kv*head_dim * N = 24*2*1*64 * 1000 = 3,072,000
     #   + int8 KV scales:   nlayers*2 * 2 bytes         = 24*2*2           =        96
     #   + scaler stats:     2 * n_features(1) * 2 bytes                    =         4
-    #   + fp16 activations: icl_emsize * N * 2 = 512 * 1000 * 2            = 1,024,000
+    #   + fp16 decoder keys: H_dec*D_dec * N * 2 = 6*64 * 1000 * 2        =   768,000
     # The inducing term depends on the shipped dist-embedder config, so derive it
     # from the config instead of hardcoding it.
     n_features = 1
@@ -809,4 +851,87 @@ def test__calculate_cache_size__tabpfn3_classifier_1000_rows() -> None:
     total = get_cache_size(**common)
 
     # Numbers need manual update if we bump the default architecture.
-    assert total == 3_072_000 + 96 + 4 + 1_024_000 + inducing
+    assert total == 3_072_000 + 96 + 4 + 768_000 + inducing
+
+
+class _GridBackend:
+    """Takes the ICL train->train call and declares the grid it leaves K/V on."""
+
+    name = "test-grid"
+    kv_grid_dtype = FP8_KV_DTYPE
+
+    def is_preferred(self, spec) -> bool:
+        return spec.num_kv_heads == spec.num_heads and spec.seq_len_q == spec.seq_len_kv
+
+    def run(self, q, k, v, **_kwargs) -> torch.Tensor:
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        )
+        return out.transpose(1, 2)
+
+
+@torch.no_grad()
+def test__kv_cache__adaptive__stores_the_grid_the_train_call_left() -> None:
+    config = tabpfn_v3.TabPFNV3Config(
+        max_num_classes=10,
+        num_buckets=5,
+        embed_dim=48,
+        nlayers=1,
+        icl_num_heads=3,
+        icl_num_kv_heads_test=1,
+        dist_embed_num_heads=3,
+        feat_agg_num_heads=3,
+    )
+    arch = tabpfn_v3.get_architecture(config)
+    arch.to(torch.float32)
+    x = torch.randn(30, 2, 5) * 0.1
+    y = torch.randint(0, 10, [26, 2], dtype=torch.float32)
+    backend = _GridBackend()
+    register_attention_backend(backend)
+    try:
+        _, cache = arch(
+            x,
+            y,
+            return_kv_cache=True,
+            performance_options=PerformanceOptions(
+                kv_cache_dtype=torch.int8, kv_cache_follows_attention_grid=True
+            ),
+        )
+    finally:
+        unregister_attention_backend(backend.name)
+
+    assert cache.kv
+    for entry in cache.kv.values():
+        assert isinstance(entry, QuantizedKVCacheEntry)
+        assert entry.key.dtype == FP8_KV_DTYPE
+
+
+@torch.no_grad()
+def test__row_chunking__shares_the_chunk_rows_over_the_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch of B members runs B times as many, B times smaller row chunks."""
+    arch = _get_regression_model().eval()  # chunked inference is off in training
+    arch.inference_chunk_cells = 8 * 5  # 8 rows of the 5-column inputs
+    perf = PerformanceOptions(use_chunkwise_inference=True)
+    torch.manual_seed(0)
+    x = torch.randn(32, 4, 5) * 0.1
+    y = torch.randn(16, 4)
+
+    chunks: list[int] = []
+    original = tabpfn_v3.TabPFNV3._process_row_chunk
+
+    def counting(self: tabpfn_v3.TabPFNV3, *args: object, **kwargs: object) -> object:
+        chunks.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(tabpfn_v3.TabPFNV3, "_process_row_chunk", counting)
+    out_batched = arch(x, y, performance_options=perf)
+    batched_chunks = len(chunks)
+    chunks.clear()
+    out_single = arch(x[:, :1], y[:, :1], performance_options=perf)
+    single_chunks = len(chunks)
+
+    assert single_chunks == 32 // 8
+    assert batched_chunks == 4 * single_chunks
+    torch.testing.assert_close(out_batched[:, :1], out_single, atol=1e-5, rtol=1e-5)
