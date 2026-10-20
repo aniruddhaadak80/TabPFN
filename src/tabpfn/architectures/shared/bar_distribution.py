@@ -615,7 +615,11 @@ class FullSupportBarDistribution(BarDistribution):
         ) / selected_probs
         conditional_prob = conditional_prob.clamp(0.0, 1.0)
 
-        values = self.borders[idx] + self.bucket_widths[idx] * conditional_prob
+        # `idx` comes from `logits`, so index same-device views of the borders.
+        # No-op when they already match.
+        borders = self.borders.to(logits.device)
+        bucket_widths = self.bucket_widths.to(logits.device)
+        values = borders[idx] + bucket_widths[idx] * conditional_prob
         side_normals = (
             self.halfnormal_with_p_weight_before(self.bucket_widths[0]),
             self.halfnormal_with_p_weight_before(self.bucket_widths[-1]),
